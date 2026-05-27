@@ -12,7 +12,7 @@ import httpx
 import qrcode
 
 from .client import AtheniaClient
-from .codex_runner import CodexRunError, CodexRunner
+from .codex_runner import CodexRunError, CodexRunner, runtime_config_fingerprint
 from .config import DEFAULT_CONFIG_PATH, WorkerConfig
 
 
@@ -188,6 +188,7 @@ def handle_next_task(
     task_id = str(task["id"])
     try:
         local_session_id = task.get("local_session_id")
+        runtime_config = task.get("runtime_config") if isinstance(task.get("runtime_config"), dict) else {}
         input_text = str(task["input_text"])
         emit_worker_log(
             client,
@@ -196,6 +197,7 @@ def handle_next_task(
             {
                 "task_id": task_id,
                 "local_session_id": local_session_id,
+                "runtime_config": runtime_config,
                 "input_preview": input_text[:160],
             },
         )
@@ -212,11 +214,12 @@ def handle_next_task(
         def log_codex_event(event_type: str, metadata: dict[str, object]) -> None:
             emit_local_log("info", f"Codex event: {event_type}", metadata)
 
-        workspace = Path(config.workspace).expanduser().resolve()
+        workspace = runner.workspace_from_runtime(runtime_config)
         before_artifacts = snapshot_workspace(workspace, config)
         result = runner.run(
             input_text,
             local_session_id=local_session_id,
+            runtime_config=runtime_config,
             on_output=send_output_frame,
             on_event=log_codex_event,
         )
@@ -234,6 +237,7 @@ def handle_next_task(
         client.complete_task(task_id, status="completed", result_text=result.content)
         if local_session_id and result.codex_session_id:
             config.codex_sessions[str(local_session_id)] = result.codex_session_id
+            config.codex_session_runtime_configs[str(local_session_id)] = runtime_config_fingerprint(runtime_config)
             config.save(config_path)
             emit_local_log(
                 "info",

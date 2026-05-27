@@ -13,6 +13,7 @@ import uuid
 DEFAULT_CONFIG_PATH = Path(os.getenv("ATHENIA_WORKER_CONFIG", "~/.athenia-worker/config.json")).expanduser()
 DEFAULT_CODEX_PERMISSION_LEVEL = "workspace-write"
 CODEX_PERMISSION_LEVELS = ("read-only", "workspace-write", "danger-full-access")
+CODEX_PERMISSION_RANK = {level: index for index, level in enumerate(CODEX_PERMISSION_LEVELS)}
 CODEX_PERMISSION_ALIASES = {
     "readonly": "read-only",
     "read-only": "read-only",
@@ -88,6 +89,16 @@ def with_codex_permission_level(command: list[str], permission_level: str) -> li
     return cleaned
 
 
+def bounded_codex_permission_level(requested: str | None, maximum: str) -> str:
+    maximum_level = normalize_codex_permission_level(maximum)
+    if requested is None or not requested.strip():
+        return maximum_level
+    requested_level = normalize_codex_permission_level(requested)
+    if CODEX_PERMISSION_RANK[requested_level] > CODEX_PERMISSION_RANK[maximum_level]:
+        return maximum_level
+    return requested_level
+
+
 def default_resource_permissions(workspace: str, permission_level: str) -> dict[str, object]:
     normalized_permission = normalize_codex_permission_level(permission_level)
     return {
@@ -113,6 +124,7 @@ class WorkerConfig:
     capabilities: list[str] = field(default_factory=lambda: ["shell", "python", "browser"])
     resource_permissions: dict[str, object] = field(default_factory=dict)
     codex_sessions: dict[str, str] = field(default_factory=dict)
+    codex_session_runtime_configs: dict[str, str] = field(default_factory=dict)
     artifact_output_dir: str = "athenia_artifacts"
     artifact_max_files: int = 20
     artifact_max_bytes: int = 25 * 1024 * 1024
@@ -212,8 +224,10 @@ class WorkerConfig:
             config.server_url = config.server_url.rstrip("/")
         if name:
             config.name = name
+        workspace_changed = False
         if workspace:
             config.workspace = str(Path(workspace).expanduser())
+            workspace_changed = True
         if codex_permission_level:
             config.codex_permission_level = normalize_codex_permission_level(codex_permission_level)
         else:
@@ -237,6 +251,8 @@ class WorkerConfig:
         else:
             config.resource_permissions["codex_permission_level"] = config.codex_permission_level
             config.resource_permissions["network"] = config.codex_permission_level == "danger-full-access"
+            if workspace_changed and isinstance(config.resource_permissions.get("roots"), list):
+                config.resource_permissions["roots"] = [config.workspace]
 
         config.save(path)
         return config

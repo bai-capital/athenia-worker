@@ -90,6 +90,31 @@ The worker stores a local mapping from Athenia chat session IDs to Codex session
 IDs in `~/.athenia-worker/config.json`, then uses `codex exec resume` for later
 messages in the same chat.
 
+## Per-Chat Sessions
+
+One worker can serve multiple Athenia chats. Each attached chat gets its own
+local session ID, and the worker maps that ID to the Codex thread ID after the
+first successful run. Later messages in the same Athenia chat resume the same
+Codex session.
+
+Athenia can send per-chat runtime settings with each task:
+
+- `working_dir`: task working directory passed to Codex with `--cd`.
+- `permission_level`: `read-only`, `workspace-write`, or `danger-full-access`.
+  The worker clamps this to the maximum permission configured when the worker was
+  started.
+- `codex_model`: Codex CLI model passed with `--model`.
+- `reasoning_effort`: `minimal`, `low`, `medium`, or `high`, passed as
+  `model_reasoning_effort`.
+
+The worker only accepts per-chat working directories under its configured
+`resource_permissions.roots`, unless the worker itself is configured for
+`danger-full-access`.
+
+If a chat's runtime settings change after a Codex thread has already been
+created, the worker starts a fresh Codex thread for that Athenia chat. This
+avoids resuming a thread with stale sandbox or working-directory settings.
+
 ## Artifacts
 
 When a task creates useful output files, write only final user-facing deliverables

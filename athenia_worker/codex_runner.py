@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Callable
+import hashlib
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import threading
+from typing import Any
 
-from .config import WorkerConfig, with_codex_permission_level
+from .config import WorkerConfig, bounded_codex_permission_level, with_codex_permission_level
 
 
 class CodexRunError(RuntimeError):
@@ -34,17 +36,25 @@ class CodexRunner:
         prompt: str,
         *,
         local_session_id: str | None = None,
+        runtime_config: dict[str, Any] | None = None,
         on_output: Callable[[str, str], None] | None = None,
         on_event: Callable[[str, dict[str, object]], None] | None = None,
     ) -> CodexResult:
-        workspace = Path(self.config.workspace).expanduser().resolve()
+        runtime_config = runtime_config or {}
+        workspace = self.workspace_from_runtime(runtime_config)
         workspace.mkdir(parents=True, exist_ok=True)
 
         prompt_text = self._artifact_prompt(prompt)
 
         with tempfile.TemporaryDirectory(prefix="athenia-worker-") as tmpdir:
             output_path = Path(tmpdir) / "codex-last-message.txt"
-            command = self._build_command(prompt_text, output_path, local_session_id=local_session_id)
+            command = self._build_command(
+                prompt_text,
+                output_path,
+                local_session_id=local_session_id,
+                workspace=workspace,
+                runtime_config=runtime_config,
+            )
             if self._uses_codex_exec(command):
                 return self._run_codex_json(
                     command,
@@ -183,26 +193,113 @@ class CodexRunner:
         output_path: Path,
         *,
         local_session_id: str | None,
+        workspace: Path,
+        runtime_config: dict[str, Any],
     ) -> list[str]:
-        command = with_codex_permission_level(
-            list(self.config.codex_command),
+        permission_level = bounded_codex_permission_level(
+            string_value(runtime_config.get("permission_level")),
             self.config.codex_permission_level,
         )
+        command = with_codex_permission_level(
+            list(self.config.codex_command),
+            permission_level,
+        )
         if command[:2] == ["codex", "exec"]:
+            command = self._with_codex_working_dir(command, workspace)
+            command = self._with_codex_model(command, string_value(runtime_config.get("codex_model")))
+            command = self._with_reasoning_effort(command, string_value(runtime_config.get("reasoning_effort")))
             if "--json" not in command:
                 command.append("--json")
             if "--output-last-message" not in command and "-o" not in command:
                 command.extend(["--output-last-message", str(output_path)])
-            codex_session_id = self._codex_session_id(local_session_id)
+            codex_session_id = self._codex_session_id(local_session_id, runtime_config)
             if codex_session_id:
                 command = self._resume_command(command, codex_session_id)
         command.append(prompt)
         return command
 
-    def _codex_session_id(self, local_session_id: str | None) -> str | None:
+    def workspace_from_runtime(self, runtime_config: dict[str, Any] | None = None) -> Path:
+        runtime_config = runtime_config or {}
+        requested = string_value(runtime_config.get("working_dir"))
+        workspace = Path(requested or self.config.workspace).expanduser().resolve()
+        if self._workspace_allowed(workspace):
+            return workspace
+        raise CodexRunError(f"Working directory is outside the worker's allowed roots: {workspace}")
+
+    def _workspace_allowed(self, workspace: Path) -> bool:
+        resource_permissions = self.config.resource_permissions or {}
+        roots = resource_permissions.get("roots")
+        if not isinstance(roots, list) or not roots:
+            roots = [self.config.workspace]
+        for root in roots:
+            try:
+                root_path = Path(str(root)).expanduser().resolve()
+            except OSError:
+                continue
+            try:
+                workspace.relative_to(root_path)
+                return True
+            except ValueError:
+                continue
+        return self.config.codex_permission_level == "danger-full-access"
+
+    def _with_codex_working_dir(self, command: list[str], workspace: Path) -> list[str]:
+        command = self._remove_option(command, {"-C", "--cd"}, takes_value=True)
+        command[2:2] = ["--cd", str(workspace)]
+        return command
+
+    def _with_codex_model(self, command: list[str], codex_model: str | None) -> list[str]:
+        if not codex_model:
+            return command
+        command = self._remove_option(command, {"-m", "--model"}, takes_value=True)
+        command[2:2] = ["--model", codex_model]
+        return command
+
+    def _with_reasoning_effort(self, command: list[str], reasoning_effort: str | None) -> list[str]:
+        if not reasoning_effort:
+            return command
+        cleaned: list[str] = command[:2]
+        index = 2
+        while index < len(command):
+            part = command[index]
+            if part in {"-c", "--config"} and index + 1 < len(command):
+                value = command[index + 1]
+                if value.startswith("model_reasoning_effort="):
+                    index += 2
+                    continue
+                cleaned.extend([part, value])
+                index += 2
+                continue
+            cleaned.append(part)
+            index += 1
+        cleaned[2:2] = ["-c", f'model_reasoning_effort="{reasoning_effort}"']
+        return cleaned
+
+    def _remove_option(self, command: list[str], names: set[str], *, takes_value: bool) -> list[str]:
+        cleaned: list[str] = []
+        index = 0
+        while index < len(command):
+            part = command[index]
+            if part in names:
+                index += 2 if takes_value else 1
+                continue
+            if takes_value and any(part.startswith(f"{name}=") for name in names if name.startswith("--")):
+                index += 1
+                continue
+            cleaned.append(part)
+            index += 1
+        return cleaned
+
+    def _codex_session_id(self, local_session_id: str | None, runtime_config: dict[str, Any]) -> str | None:
         if not local_session_id:
             return None
-        return self.config.codex_sessions.get(local_session_id)
+        codex_session_id = self.config.codex_sessions.get(local_session_id)
+        if not codex_session_id:
+            return None
+        previous_fingerprint = self.config.codex_session_runtime_configs.get(local_session_id)
+        if previous_fingerprint and previous_fingerprint != runtime_config_fingerprint(runtime_config):
+            return None
+        return codex_session_id
 
     def _resume_command(self, command: list[str], codex_session_id: str) -> list[str]:
         resume = command[:2] + ["resume"]
@@ -220,6 +317,12 @@ class CodexRunner:
                 index += 1
                 continue
             if part.startswith("--sandbox="):
+                index += 1
+                continue
+            if part in {"-C", "--cd", "--add-dir"}:
+                index += 2
+                continue
+            if part.startswith("--cd=") or part.startswith("--add-dir="):
                 index += 1
                 continue
             resume.append(part)
@@ -282,3 +385,15 @@ class CodexRunner:
                 return text, "replace"
 
         return "", "append"
+
+
+def string_value(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def runtime_config_fingerprint(runtime_config: dict[str, Any] | None) -> str:
+    payload = json.dumps(runtime_config or {}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
