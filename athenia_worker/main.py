@@ -69,6 +69,12 @@ def add_config_options(parser: argparse.ArgumentParser) -> None:
         help="Codex sandbox permission level for worker tasks.",
     )
     parser.add_argument("--codex-command")
+    parser.add_argument(
+        "--available-model",
+        action="append",
+        dest="available_models",
+        help="Codex model slug to report to Athenia. Repeat or pass comma-separated values.",
+    )
 
 
 def load_or_create_from_args(args: argparse.Namespace) -> WorkerConfig:
@@ -80,6 +86,7 @@ def load_or_create_from_args(args: argparse.Namespace) -> WorkerConfig:
         workspace=getattr(args, "workspace", None),
         codex_permission_level=getattr(args, "permission_level", None),
         codex_command=codex_command,
+        available_models=getattr(args, "available_models", None),
     )
 
 

@@ -77,6 +77,7 @@ Configuration can also be set with environment variables:
 - `ATHENIA_WORKSPACE`
 - `ATHENIA_CODEX_PERMISSION_LEVEL`
 - `ATHENIA_CODEX_COMMAND`
+- `ATHENIA_CODEX_MODELS`
 - `ATHENIA_WORKER_CONFIG`
 
 By default the worker runs
@@ -85,6 +86,16 @@ effort so a private workspace does not need to be a Git repository and short
 worker commands return promptly. Set `ATHENIA_CODEX_PERMISSION_LEVEL` or pass
 `--permission-level` to choose `read-only`, `workspace-write`, or
 `danger-full-access`.
+
+The worker reports available Codex model slugs to Athenia during bootstrap and
+heartbeat. By default it reads the local Codex catalog with `codex debug models`.
+To pin the app picker to a specific set, pass `--available-model` one or more
+times or set `ATHENIA_CODEX_MODELS` to comma-separated slugs:
+
+```bash
+athenia-worker init --available-model gpt-5.5 --available-model gpt-5-codex
+ATHENIA_CODEX_MODELS=gpt-5.5,gpt-5-codex athenia-worker serve
+```
 
 The worker stores a local mapping from Athenia chat session IDs to Codex session
 IDs in `~/.athenia-worker/config.json`, then uses `codex exec resume` for later

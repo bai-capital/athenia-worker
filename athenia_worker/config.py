@@ -7,6 +7,7 @@ from pathlib import Path
 import secrets
 import shlex
 import socket
+import subprocess
 import uuid
 
 
@@ -46,6 +47,95 @@ def _default_codex_command() -> list[str]:
         "-c",
         'model_reasoning_effort="low"',
     ], default_codex_permission_level())
+
+
+def _split_model_list(values: list[str] | tuple[str, ...] | str | None) -> list[str]:
+    if values is None:
+        return []
+    raw_values = [values] if isinstance(values, str) else list(values)
+    models: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        for part in str(raw).replace("\n", ",").split(","):
+            model = part.strip()
+            if model and model not in seen:
+                seen.add(model)
+                models.append(model)
+    return models
+
+
+def _codex_binary(command: list[str] | None = None) -> str:
+    if command and len(command) >= 2 and Path(command[0]).name == "codex" and command[1] == "exec":
+        return command[0]
+    return "codex"
+
+
+def _configured_model_from_command(command: list[str]) -> str | None:
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part in {"-m", "--model"} and index + 1 < len(command):
+            return command[index + 1].strip() or None
+        if part.startswith("--model="):
+            return part.split("=", 1)[1].strip() or None
+        if part in {"-c", "--config"} and index + 1 < len(command):
+            value = command[index + 1]
+            if value.startswith("model="):
+                return value.split("=", 1)[1].strip().strip('"').strip("'") or None
+            index += 2
+            continue
+        index += 1
+    return None
+
+
+def discover_codex_models(command: list[str] | None = None) -> list[str]:
+    try:
+        completed = subprocess.run(
+            [_codex_binary(command), "debug", "models"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return []
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return []
+
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("slug") or "").strip()
+        visibility = str(entry.get("visibility") or "")
+        if not slug or slug in seen or visibility == "hidden":
+            continue
+        seen.add(slug)
+        slugs.append(slug)
+    return slugs
+
+
+def default_available_models(command: list[str] | None = None) -> list[str]:
+    env_models = _split_model_list(
+        os.getenv("ATHENIA_CODEX_MODELS") or os.getenv("ATHENIA_AVAILABLE_MODELS")
+    )
+    if env_models:
+        return env_models
+
+    command = command or _default_codex_command()
+    models = discover_codex_models(command)
+    configured_model = _configured_model_from_command(command)
+    if configured_model and configured_model not in models:
+        models.insert(0, configured_model)
+    return models
 
 
 def default_codex_permission_level() -> str:
@@ -122,6 +212,7 @@ class WorkerConfig:
     codex_command: list[str] = field(default_factory=_default_codex_command)
     poll_interval_seconds: float = 2.0
     capabilities: list[str] = field(default_factory=lambda: ["shell", "python", "browser"])
+    available_models: list[str] = field(default_factory=default_available_models)
     resource_permissions: dict[str, object] = field(default_factory=dict)
     codex_sessions: dict[str, str] = field(default_factory=dict)
     codex_session_runtime_configs: dict[str, str] = field(default_factory=dict)
@@ -212,6 +303,7 @@ class WorkerConfig:
         workspace: str | None = None,
         codex_permission_level: str | None = None,
         codex_command: list[str] | None = None,
+        available_models: list[str] | None = None,
     ) -> WorkerConfig:
         if path.exists():
             config = cls.load(path)
@@ -243,6 +335,16 @@ class WorkerConfig:
             config.codex_command,
             config.codex_permission_level,
         )
+        if available_models:
+            config.available_models = _split_model_list(available_models)
+        else:
+            env_models = _split_model_list(
+                os.getenv("ATHENIA_CODEX_MODELS") or os.getenv("ATHENIA_AVAILABLE_MODELS")
+            )
+            if env_models:
+                config.available_models = env_models
+            elif not config.available_models:
+                config.available_models = default_available_models(config.codex_command)
         if not config.resource_permissions:
             config.resource_permissions = default_resource_permissions(
                 config.workspace,

@@ -60,12 +60,18 @@ class AtheniaClient:
                 "worker_type": self.config.worker_type,
                 "name": self.config.name,
                 "capabilities": self.config.capabilities,
+                "available_models": self.config.available_models,
                 "resource_permissions": self.config.resource_permissions,
             },
         )
 
     def heartbeat(self) -> dict[str, Any]:
-        return self._request("POST", "/v1/worker-runtime/heartbeat", auth=True)
+        return self._request(
+            "POST",
+            "/v1/worker-runtime/heartbeat",
+            auth=True,
+            json={"available_models": self.config.available_models},
+        )
 
     def log(self, level: str, message: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._request(
