@@ -144,9 +144,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
         try_bootstrap(client)
         emit_worker_log(client, "info", "Worker started.", {"workspace": config.workspace})
         runner = CodexRunner(config)
+        consecutive_errors = 0
 
         while True:
-            handled = handle_next_task(client, runner, config, args.config)
+            try:
+                handled = handle_next_task(client, runner, config, args.config)
+                consecutive_errors = 0
+            except Exception as exc:
+                consecutive_errors += 1
+                emit_local_log(
+                    "error",
+                    "Worker loop failed while contacting Athenia.",
+                    {"error": str(exc) or exc.__class__.__name__, "consecutive_errors": consecutive_errors},
+                )
+                if args.run_once:
+                    return 1
+                time.sleep(min(config.poll_interval_seconds * (2 ** min(consecutive_errors - 1, 5)), 60.0))
+                continue
             if args.run_once:
                 return 0 if handled else 2
             if not handled:
@@ -193,6 +207,7 @@ def handle_next_task(
         return False
 
     task_id = str(task["id"])
+    task_completed = False
     try:
         local_session_id = task.get("local_session_id")
         runtime_config = task.get("runtime_config") if isinstance(task.get("runtime_config"), dict) else {}
@@ -242,16 +257,24 @@ def handle_next_task(
             config,
         )
         client.complete_task(task_id, status="completed", result_text=result.content)
+        task_completed = True
         if local_session_id and result.codex_session_id:
-            config.codex_sessions[str(local_session_id)] = result.codex_session_id
-            config.codex_session_runtime_configs[str(local_session_id)] = runtime_config_fingerprint(runtime_config)
-            config.save(config_path)
-            emit_local_log(
-                "info",
-                "Saved Codex session mapping.",
-                {"local_session_id": local_session_id, "codex_session_id": result.codex_session_id},
-            )
-        emit_worker_log(
+            try:
+                config.codex_sessions[str(local_session_id)] = result.codex_session_id
+                config.codex_session_runtime_configs[str(local_session_id)] = runtime_config_fingerprint(runtime_config)
+                config.save(config_path)
+                emit_local_log(
+                    "info",
+                    "Saved Codex session mapping.",
+                    {"local_session_id": local_session_id, "codex_session_id": result.codex_session_id},
+                )
+            except Exception as exc:
+                emit_local_log(
+                    "warning",
+                    "Task completed, but failed to save Codex session mapping.",
+                    {"task_id": task_id, "error": str(exc) or exc.__class__.__name__},
+                )
+        safe_emit_worker_log(
             client,
             "info",
             "Worker task completed.",
@@ -264,12 +287,14 @@ def handle_next_task(
         )
     except (CodexRunError, subprocess.TimeoutExpired) as exc:
         message = str(exc)
-        client.complete_task(task_id, status="failed", error=message)
-        emit_worker_log(client, "error", "Worker task failed.", {"task_id": task_id, "error": message})
+        if not task_completed:
+            complete_task_failed(client, task_id, message)
+        safe_emit_worker_log(client, "error", "Worker task failed.", {"task_id": task_id, "error": message})
     except Exception as exc:
         message = str(exc) or exc.__class__.__name__
-        client.complete_task(task_id, status="failed", error=message)
-        emit_worker_log(client, "error", "Worker task failed.", {"task_id": task_id, "error": message})
+        if not task_completed:
+            complete_task_failed(client, task_id, message)
+        safe_emit_worker_log(client, "error", "Worker task failed.", {"task_id": task_id, "error": message})
     return True
 
 
@@ -403,6 +428,33 @@ def emit_worker_log(
 ) -> None:
     emit_local_log(level, message, metadata)
     client.log(level, message, metadata)
+
+
+def safe_emit_worker_log(
+    client: AtheniaClient,
+    level: str,
+    message: str,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    try:
+        emit_worker_log(client, level, message, metadata)
+    except Exception as exc:
+        emit_local_log(
+            "warning",
+            "Failed to send worker log.",
+            {"original_message": message, "error": str(exc) or exc.__class__.__name__},
+        )
+
+
+def complete_task_failed(client: AtheniaClient, task_id: str, message: str) -> None:
+    try:
+        client.complete_task(task_id, status="failed", error=message)
+    except Exception as exc:
+        emit_local_log(
+            "error",
+            "Worker task failed, and failure reporting also failed.",
+            {"task_id": task_id, "task_error": message, "report_error": str(exc) or exc.__class__.__name__},
+        )
 
 
 def print_pairing_payload(client: AtheniaClient) -> None:

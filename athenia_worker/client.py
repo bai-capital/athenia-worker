@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any
 from urllib.parse import urlencode
 
@@ -28,9 +29,18 @@ class PairingPayload:
 
 
 class AtheniaClient:
-    def __init__(self, config: WorkerConfig, *, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        config: WorkerConfig,
+        *,
+        timeout: float = 60.0,
+        max_attempts: int = 4,
+        backoff_base_seconds: float = 0.5,
+    ) -> None:
         self.config = config
-        self._client = httpx.Client(base_url=config.server_url, timeout=timeout)
+        self._client = httpx.Client(base_url=config.server_url, timeout=timeout, trust_env=False)
+        self.max_attempts = max(1, max_attempts)
+        self.backoff_base_seconds = max(0.0, backoff_base_seconds)
 
     def close(self) -> None:
         self._client.close()
@@ -145,8 +155,44 @@ class AtheniaClient:
         if auth:
             request_headers["Authorization"] = f"Bearer {self.config.worker_token}"
 
-        response = self._client.request(method, path, headers=request_headers, **kwargs)
-        response.raise_for_status()
-        if not response.content:
-            return None
-        return response.json()
+        attempts = self.max_attempts
+        for attempt in range(1, attempts + 1):
+            self._rewind_files(kwargs.get("files"))
+            try:
+                response = self._client.request(method, path, headers=request_headers, **kwargs)
+                response.raise_for_status()
+                if not response.content:
+                    return None
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                if not self._is_retryable_status(exc.response.status_code) or attempt == attempts:
+                    raise
+                self._sleep_before_retry(attempt)
+            except httpx.RequestError:
+                if attempt == attempts:
+                    raise
+                self._sleep_before_retry(attempt)
+
+        raise RuntimeError("Athenia request retry loop exhausted unexpectedly.")
+
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        return status_code == 429 or 500 <= status_code < 600
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        if self.backoff_base_seconds <= 0:
+            return
+        time.sleep(min(self.backoff_base_seconds * (2 ** (attempt - 1)), 8.0))
+
+    @staticmethod
+    def _rewind_files(files: object) -> None:
+        if not isinstance(files, dict):
+            return
+        for value in files.values():
+            if isinstance(value, tuple) and len(value) >= 2:
+                handle = value[1]
+                if hasattr(handle, "seek"):
+                    try:
+                        handle.seek(0)
+                    except OSError:
+                        pass
