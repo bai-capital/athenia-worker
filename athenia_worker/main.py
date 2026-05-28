@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import mimetypes
 import shlex
 import sys
@@ -144,32 +146,119 @@ def cmd_serve(args: argparse.Namespace) -> int:
         try_bootstrap(client)
         emit_worker_log(client, "info", "Worker started.", {"workspace": config.workspace})
         runner = CodexRunner(config)
-        consecutive_errors = 0
-
-        while True:
-            try:
-                handled = handle_next_task(client, runner, config, args.config)
-                consecutive_errors = 0
-            except Exception as exc:
-                consecutive_errors += 1
-                emit_local_log(
-                    "error",
-                    "Worker loop failed while contacting Athenia.",
-                    {"error": str(exc) or exc.__class__.__name__, "consecutive_errors": consecutive_errors},
-                )
-                if args.run_once:
-                    return 1
-                time.sleep(min(config.poll_interval_seconds * (2 ** min(consecutive_errors - 1, 5)), 60.0))
-                continue
-            if args.run_once:
-                return 0 if handled else 2
-            if not handled:
-                time.sleep(config.poll_interval_seconds)
+        if not args.run_once and config.transport == "websocket":
+            return websocket_loop(client, runner, config, args.config)
+        return polling_loop(client, runner, config, args.config, run_once=args.run_once)
 
 
 def cmd_run_once(args: argparse.Namespace) -> int:
     args.run_once = True
     return cmd_serve(args)
+
+
+def polling_loop(
+    client: AtheniaClient,
+    runner: CodexRunner,
+    config: WorkerConfig,
+    config_path: Path,
+    *,
+    run_once: bool,
+) -> int:
+    consecutive_errors = 0
+
+    while True:
+        try:
+            handled = handle_next_task(client, runner, config, config_path)
+            consecutive_errors = 0
+        except Exception as exc:
+            consecutive_errors += 1
+            emit_local_log(
+                "error",
+                "Worker loop failed while contacting Athenia.",
+                {"error": str(exc) or exc.__class__.__name__, "consecutive_errors": consecutive_errors},
+            )
+            if run_once:
+                return 1
+            time.sleep(min(config.poll_interval_seconds * (2 ** min(consecutive_errors - 1, 5)), 60.0))
+            continue
+        if run_once:
+            return 0 if handled else 2
+        if not handled:
+            time.sleep(config.poll_interval_seconds)
+
+
+def websocket_loop(
+    client: AtheniaClient,
+    runner: CodexRunner,
+    config: WorkerConfig,
+    config_path: Path,
+) -> int:
+    consecutive_errors = 0
+    while True:
+        try:
+            asyncio.run(run_websocket_session(client, runner, config, config_path))
+            consecutive_errors = 0
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            consecutive_errors += 1
+            emit_local_log(
+                "warning",
+                "Worker WebSocket session ended; reconnecting.",
+                {"error": str(exc) or exc.__class__.__name__, "consecutive_errors": consecutive_errors},
+            )
+        time.sleep(min(config.websocket_reconnect_seconds * (2 ** min(consecutive_errors, 5)), 60.0))
+
+
+async def run_websocket_session(
+    client: AtheniaClient,
+    runner: CodexRunner,
+    config: WorkerConfig,
+    config_path: Path,
+) -> None:
+    import websockets
+
+    async with websockets.connect(
+        client.websocket_url,
+        additional_headers={"Authorization": f"Bearer {config.worker_token}"},
+        ping_interval=30,
+        ping_timeout=30,
+    ) as websocket:
+        emit_local_log("info", "Connected to Athenia worker runtime WebSocket.", {"url": client.websocket_url})
+        await websocket.send(json.dumps({"type": "worker.hello", "available_models": config.available_models}))
+
+        async for raw_message in websocket:
+            try:
+                message = json.loads(raw_message)
+            except json.JSONDecodeError:
+                emit_local_log("warning", "Ignored non-JSON WebSocket message.")
+                continue
+            if not isinstance(message, dict):
+                emit_local_log("warning", "Ignored non-object WebSocket message.")
+                continue
+
+            message_type = str(message.get("type") or "")
+            if message_type == "task.assigned":
+                task = message.get("task")
+                if isinstance(task, dict):
+                    handle_task(client, runner, config, config_path, task)
+                    await websocket.send(json.dumps({"type": "task.ready"}))
+                continue
+
+            if message_type in {"worker.connected", "worker.ack"}:
+                worker = message.get("worker") if isinstance(message.get("worker"), dict) else {}
+                emit_local_log(
+                    "info",
+                    "Worker runtime acknowledged.",
+                    {"status": worker.get("status"), "worker_id": worker.get("id")},
+                )
+                continue
+
+            if message_type == "error":
+                emit_local_log("warning", "Athenia worker runtime returned an error.", {"detail": message.get("detail")})
+                continue
+
+            emit_local_log("debug", "Ignored WebSocket message.", {"type": message_type})
 
 
 def try_bootstrap(client: AtheniaClient) -> None:
@@ -205,6 +294,17 @@ def handle_next_task(
     task = client.next_task()
     if not task:
         return False
+    handle_task(client, runner, config, config_path, task)
+    return True
+
+
+def handle_task(
+    client: AtheniaClient,
+    runner: CodexRunner,
+    config: WorkerConfig,
+    config_path: Path,
+    task: dict,
+) -> None:
 
     task_id = str(task["id"])
     task_completed = False
@@ -295,7 +395,6 @@ def handle_next_task(
         if not task_completed:
             complete_task_failed(client, task_id, message)
         safe_emit_worker_log(client, "error", "Worker task failed.", {"task_id": task_id, "error": message})
-    return True
 
 
 ArtifactSnapshot = dict[str, tuple[int, int]]

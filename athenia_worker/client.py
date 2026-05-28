@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -58,6 +58,12 @@ class AtheniaClient:
             pairing_secret=self.config.pairing_secret,
             server_url=self.config.server_url,
         )
+
+    @property
+    def websocket_url(self) -> str:
+        parsed = urlparse(self.config.server_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return urlunparse(parsed._replace(scheme=scheme, path="/v1/worker-runtime/ws", params="", query="", fragment=""))
 
     def bootstrap(self) -> dict[str, Any]:
         return self._request(

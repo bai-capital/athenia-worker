@@ -3,9 +3,10 @@
 Private execution worker for Athenia agentic tasks.
 
 The worker runs on a user's machine, registers a one-time pairing secret with the
-Athenia backend, prints a QR payload, then polls for tasks assigned to its paired
-worker identity. Tasks are executed through the local Codex CLI in the configured
-workspace, and results are relayed back to Athenia.
+Athenia backend, prints a QR payload, then keeps a WebSocket runtime connection
+open for tasks assigned to its paired worker identity. Tasks are executed through
+the local Codex CLI in the configured workspace, and results are relayed back to
+Athenia over the existing authenticated HTTP reporting endpoints.
 
 While tasks run, the worker prints local lifecycle logs and streams Codex JSON
 events back to Athenia as text frames. The backend can use those frames to update
@@ -78,6 +79,8 @@ Configuration can also be set with environment variables:
 - `ATHENIA_CODEX_PERMISSION_LEVEL`
 - `ATHENIA_CODEX_COMMAND`
 - `ATHENIA_CODEX_MODELS`
+- `ATHENIA_WORKER_TRANSPORT` (`websocket` by default, or `poll` for the legacy
+  HTTP polling loop)
 - `ATHENIA_WORKER_CONFIG`
 
 By default the worker runs

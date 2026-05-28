@@ -216,6 +216,8 @@ class WorkerConfig:
     resource_permissions: dict[str, object] = field(default_factory=dict)
     codex_sessions: dict[str, str] = field(default_factory=dict)
     codex_session_runtime_configs: dict[str, str] = field(default_factory=dict)
+    transport: str = field(default_factory=lambda: os.getenv("ATHENIA_WORKER_TRANSPORT", "websocket"))
+    websocket_reconnect_seconds: float = 2.0
     artifact_output_dir: str = "athenia_artifacts"
     artifact_max_files: int = 20
     artifact_max_bytes: int = 25 * 1024 * 1024
@@ -355,6 +357,11 @@ class WorkerConfig:
             config.resource_permissions["network"] = config.codex_permission_level == "danger-full-access"
             if workspace_changed and isinstance(config.resource_permissions.get("roots"), list):
                 config.resource_permissions["roots"] = [config.workspace]
+        env_transport = os.getenv("ATHENIA_WORKER_TRANSPORT")
+        if env_transport:
+            config.transport = env_transport.strip().lower()
+        if config.transport not in {"websocket", "poll"}:
+            config.transport = "websocket"
 
         config.save(path)
         return config
