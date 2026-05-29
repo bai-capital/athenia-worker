@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
 import mimetypes
 import shlex
 import sys
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -52,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser = subparsers.add_parser("serve")
     add_config_options(serve_parser)
     serve_parser.add_argument("--run-once", action="store_true")
+    serve_parser.add_argument("--max-concurrency", type=int, help="Maximum worker tasks to run at the same time.")
     serve_parser.set_defaults(func=cmd_serve)
 
     run_once_parser = subparsers.add_parser("run-once")
@@ -81,7 +84,7 @@ def add_config_options(parser: argparse.ArgumentParser) -> None:
 
 def load_or_create_from_args(args: argparse.Namespace) -> WorkerConfig:
     codex_command = shlex.split(args.codex_command) if getattr(args, "codex_command", None) else None
-    return WorkerConfig.load_or_create(
+    config = WorkerConfig.load_or_create(
         args.config,
         server_url=getattr(args, "server_url", None),
         name=getattr(args, "name", None),
@@ -90,6 +93,11 @@ def load_or_create_from_args(args: argparse.Namespace) -> WorkerConfig:
         codex_command=codex_command,
         available_models=getattr(args, "available_models", None),
     )
+    max_concurrency = getattr(args, "max_concurrency", None)
+    if max_concurrency is not None:
+        config.max_concurrency = max(1, int(max_concurrency))
+        config.save(args.config)
+    return config
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -144,7 +152,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     config = load_or_create_from_args(args)
     with AtheniaClient(config) as client:
         try_bootstrap(client)
-        emit_worker_log(client, "info", "Worker started.", {"workspace": config.workspace})
+        emit_worker_log(
+            client,
+            "info",
+            "Worker started.",
+            {"workspace": config.workspace, "max_concurrency": config.max_concurrency, "transport": config.transport},
+        )
         runner = CodexRunner(config)
         if not args.run_once and config.transport == "websocket":
             return websocket_loop(client, runner, config, args.config)
@@ -164,11 +177,25 @@ def polling_loop(
     *,
     run_once: bool,
 ) -> int:
+    if run_once or config.max_concurrency <= 1:
+        return single_task_polling_loop(client, runner, config, config_path, run_once=run_once)
+
+    return concurrent_polling_loop(client, config, config_path)
+
+
+def single_task_polling_loop(
+    client: AtheniaClient,
+    runner: CodexRunner,
+    config: WorkerConfig,
+    config_path: Path,
+    *,
+    run_once: bool,
+) -> int:
     consecutive_errors = 0
 
     while True:
         try:
-            handled = handle_next_task(client, runner, config, config_path)
+            handled = handle_next_task(client, runner, config, config_path, threading.Lock())
             consecutive_errors = 0
         except Exception as exc:
             consecutive_errors += 1
@@ -185,6 +212,46 @@ def polling_loop(
             return 0 if handled else 2
         if not handled:
             time.sleep(config.poll_interval_seconds)
+
+
+def concurrent_polling_loop(
+    client: AtheniaClient,
+    config: WorkerConfig,
+    config_path: Path,
+) -> int:
+    config_lock = threading.Lock()
+    active: set[Future] = set()
+    consecutive_errors = 0
+
+    with ThreadPoolExecutor(max_workers=config.max_concurrency, thread_name_prefix="athenia-worker-task") as executor:
+        while True:
+            active = reap_task_futures(active)
+            claimed = False
+            while len(active) < config.max_concurrency:
+                try:
+                    task = client.next_task()
+                    consecutive_errors = 0
+                except Exception as exc:
+                    consecutive_errors += 1
+                    emit_local_log(
+                        "error",
+                        "Worker loop failed while contacting Athenia.",
+                        {"error": str(exc) or exc.__class__.__name__, "consecutive_errors": consecutive_errors},
+                    )
+                    time.sleep(min(config.poll_interval_seconds * (2 ** min(consecutive_errors - 1, 5)), 60.0))
+                    break
+                if not task:
+                    break
+                claimed = True
+                active.add(executor.submit(run_task_in_thread, config, config_path, task, config_lock))
+
+            if not active:
+                time.sleep(config.poll_interval_seconds)
+                continue
+            if not claimed:
+                done, _ = wait(active, timeout=config.poll_interval_seconds, return_when=FIRST_COMPLETED)
+                if done:
+                    active = reap_task_futures(active)
 
 
 def websocket_loop(
@@ -227,38 +294,71 @@ async def run_websocket_session(
         emit_local_log("info", "Connected to Athenia worker runtime WebSocket.", {"url": client.websocket_url})
         await websocket.send(json.dumps({"type": "worker.hello", "available_models": config.available_models}))
 
-        async for raw_message in websocket:
-            try:
-                message = json.loads(raw_message)
-            except json.JSONDecodeError:
-                emit_local_log("warning", "Ignored non-JSON WebSocket message.")
-                continue
-            if not isinstance(message, dict):
-                emit_local_log("warning", "Ignored non-object WebSocket message.")
-                continue
-
-            message_type = str(message.get("type") or "")
-            if message_type == "task.assigned":
-                task = message.get("task")
-                if isinstance(task, dict):
-                    handle_task(client, runner, config, config_path, task)
-                    await websocket.send(json.dumps({"type": "task.ready"}))
-                continue
-
-            if message_type in {"worker.connected", "worker.ack"}:
-                worker = message.get("worker") if isinstance(message.get("worker"), dict) else {}
-                emit_local_log(
-                    "info",
-                    "Worker runtime acknowledged.",
-                    {"status": worker.get("status"), "worker_id": worker.get("id")},
+        loop = asyncio.get_running_loop()
+        config_lock = threading.Lock()
+        active: set[asyncio.Future] = set()
+        receive_task = asyncio.create_task(websocket.recv())
+        with ThreadPoolExecutor(max_workers=config.max_concurrency, thread_name_prefix="athenia-worker-task") as executor:
+            while True:
+                done, _ = await asyncio.wait(
+                    {receive_task, *active},
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                continue
 
-            if message_type == "error":
-                emit_local_log("warning", "Athenia worker runtime returned an error.", {"detail": message.get("detail")})
-                continue
+                for task_future in list(active & done):
+                    active.remove(task_future)
+                    try:
+                        task_future.result()
+                    except Exception as exc:
+                        emit_local_log("error", "Worker task thread crashed.", {"error": str(exc) or exc.__class__.__name__})
+                    await websocket.send(json.dumps({"type": "task.ready"}))
 
-            emit_local_log("debug", "Ignored WebSocket message.", {"type": message_type})
+                if receive_task not in done:
+                    continue
+
+                raw_message = receive_task.result()
+                receive_task = asyncio.create_task(websocket.recv())
+                try:
+                    message = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    emit_local_log("warning", "Ignored non-JSON WebSocket message.")
+                    continue
+                if not isinstance(message, dict):
+                    emit_local_log("warning", "Ignored non-object WebSocket message.")
+                    continue
+
+                message_type = str(message.get("type") or "")
+                if message_type == "task.assigned":
+                    task = message.get("task")
+                    if isinstance(task, dict):
+                        active.add(
+                            loop.run_in_executor(
+                                executor,
+                                run_task_in_thread,
+                                config,
+                                config_path,
+                                task,
+                                config_lock,
+                            )
+                        )
+                        if len(active) < config.max_concurrency:
+                            await websocket.send(json.dumps({"type": "task.ready"}))
+                    continue
+
+                if message_type in {"worker.connected", "worker.ack"}:
+                    worker = message.get("worker") if isinstance(message.get("worker"), dict) else {}
+                    emit_local_log(
+                        "info",
+                        "Worker runtime acknowledged.",
+                        {"status": worker.get("status"), "worker_id": worker.get("id")},
+                    )
+                    continue
+
+                if message_type == "error":
+                    emit_local_log("warning", "Athenia worker runtime returned an error.", {"detail": message.get("detail")})
+                    continue
+
+                emit_local_log("debug", "Ignored WebSocket message.", {"type": message_type})
 
 
 def try_bootstrap(client: AtheniaClient) -> None:
@@ -290,12 +390,36 @@ def handle_next_task(
     runner: CodexRunner,
     config: WorkerConfig,
     config_path: Path,
+    config_lock: threading.Lock,
 ) -> bool:
     task = client.next_task()
     if not task:
         return False
-    handle_task(client, runner, config, config_path, task)
+    handle_task(client, runner, config, config_path, task, config_lock)
     return True
+
+
+def run_task_in_thread(
+    config: WorkerConfig,
+    config_path: Path,
+    task: dict,
+    config_lock: threading.Lock,
+) -> None:
+    with AtheniaClient(config) as client:
+        handle_task(client, CodexRunner(config), config, config_path, task, config_lock)
+
+
+def reap_task_futures(active: set[Future]) -> set[Future]:
+    remaining: set[Future] = set()
+    for task_future in active:
+        if not task_future.done():
+            remaining.add(task_future)
+            continue
+        try:
+            task_future.result()
+        except Exception as exc:
+            emit_local_log("error", "Worker task thread crashed.", {"error": str(exc) or exc.__class__.__name__})
+    return remaining
 
 
 def handle_task(
@@ -304,6 +428,7 @@ def handle_task(
     config: WorkerConfig,
     config_path: Path,
     task: dict,
+    config_lock: threading.Lock,
 ) -> None:
 
     task_id = str(task["id"])
@@ -360,9 +485,10 @@ def handle_task(
         task_completed = True
         if local_session_id and result.codex_session_id:
             try:
-                config.codex_sessions[str(local_session_id)] = result.codex_session_id
-                config.codex_session_runtime_configs[str(local_session_id)] = runtime_config_fingerprint(runtime_config)
-                config.save(config_path)
+                with config_lock:
+                    config.codex_sessions[str(local_session_id)] = result.codex_session_id
+                    config.codex_session_runtime_configs[str(local_session_id)] = runtime_config_fingerprint(runtime_config)
+                    config.save(config_path)
                 emit_local_log(
                     "info",
                     "Saved Codex session mapping.",

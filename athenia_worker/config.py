@@ -218,6 +218,7 @@ class WorkerConfig:
     codex_session_runtime_configs: dict[str, str] = field(default_factory=dict)
     transport: str = field(default_factory=lambda: os.getenv("ATHENIA_WORKER_TRANSPORT", "websocket"))
     websocket_reconnect_seconds: float = 2.0
+    max_concurrency: int = field(default_factory=lambda: int(os.getenv("ATHENIA_WORKER_MAX_CONCURRENCY", "1")))
     artifact_output_dir: str = "athenia_artifacts"
     artifact_max_files: int = 20
     artifact_max_bytes: int = 25 * 1024 * 1024
@@ -362,6 +363,8 @@ class WorkerConfig:
             config.transport = env_transport.strip().lower()
         if config.transport not in {"websocket", "poll"}:
             config.transport = "websocket"
+        if config.max_concurrency < 1:
+            config.max_concurrency = 1
 
         config.save(path)
         return config

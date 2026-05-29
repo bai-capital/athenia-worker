@@ -79,6 +79,7 @@ Configuration can also be set with environment variables:
 - `ATHENIA_CODEX_PERMISSION_LEVEL`
 - `ATHENIA_CODEX_COMMAND`
 - `ATHENIA_CODEX_MODELS`
+- `ATHENIA_WORKER_MAX_CONCURRENCY`
 - `ATHENIA_WORKER_TRANSPORT` (`websocket` by default, or `poll` for the legacy
   HTTP polling loop)
 - `ATHENIA_WORKER_CONFIG`
@@ -103,6 +104,25 @@ ATHENIA_CODEX_MODELS=gpt-5.5,gpt-5-codex athenia-worker serve
 The worker stores a local mapping from Athenia chat session IDs to Codex session
 IDs in `~/.athenia-worker/config.json`, then uses `codex exec resume` for later
 messages in the same chat.
+
+## Concurrent Tasks
+
+By default one worker runs one Codex task at a time. To let one worker run
+several Athenia chats in parallel, start it with `--max-concurrency`:
+
+```bash
+athenia-worker serve --max-concurrency 3
+```
+
+or set:
+
+```bash
+ATHENIA_WORKER_MAX_CONCURRENCY=3 athenia-worker serve
+```
+
+Use separate working directories for parallel sessions whenever possible.
+Concurrent Codex tasks in the same directory can still edit the same files and
+create normal source-control conflicts.
 
 ## Per-Chat Sessions
 
