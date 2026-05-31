@@ -58,6 +58,7 @@ class CodexRunner:
             if self._uses_codex_exec(command):
                 return self._run_codex_json(
                     command,
+                    prompt=prompt_text,
                     workspace=workspace,
                     output_path=output_path,
                     on_output=on_output,
@@ -95,6 +96,7 @@ class CodexRunner:
         self,
         command: list[str],
         *,
+        prompt: str,
         workspace: Path,
         output_path: Path,
         on_output: Callable[[str, str], None] | None,
@@ -105,15 +107,22 @@ class CodexRunner:
         streamed_frames = 0
         final_message = ""
         codex_session_id: str | None = None
+        codex_error = ""
 
         process = subprocess.Popen(
             command,
             cwd=workspace,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
+        assert process.stdin is not None
+        try:
+            process.stdin.write(prompt)
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
 
         def read_stderr() -> None:
             assert process.stderr is not None
@@ -141,6 +150,8 @@ class CodexRunner:
                 event_type = str(event.get("type", "unknown"))
                 if event_type == "thread.started" and isinstance(event.get("thread_id"), str):
                     codex_session_id = str(event["thread_id"])
+                if event_type == "error":
+                    codex_error = self._error_detail(event)
                 if on_event:
                     on_event(event_type, self._event_metadata(event))
 
@@ -167,10 +178,10 @@ class CodexRunner:
         content = last_message or final_message
 
         if returncode != 0:
-            detail = stderr or stdout or f"Codex exited with {returncode}."
+            detail = codex_error or stderr or stdout or f"Codex exited with {returncode}."
             raise CodexRunError(detail)
         if not content:
-            detail = stderr or stdout
+            detail = codex_error or stderr or stdout
             if detail:
                 raise CodexRunError(f"Codex completed without a final message. Captured output: {detail[:2000]}")
             raise CodexRunError("Codex completed without a final message.")
@@ -215,16 +226,28 @@ class CodexRunner:
             codex_session_id = self._codex_session_id(local_session_id, runtime_config)
             if codex_session_id:
                 command = self._resume_command(command, codex_session_id)
-        command.append(prompt)
+        if self._is_codex_exec_command(command):
+            command.append("-")
+        else:
+            command.append(prompt)
         return command
 
     def workspace_from_runtime(self, runtime_config: dict[str, Any] | None = None) -> Path:
         runtime_config = runtime_config or {}
         requested = string_value(runtime_config.get("working_dir"))
-        workspace = Path(requested or self.config.workspace).expanduser().resolve()
+        workspace = self._workspace_path(requested)
         if self._workspace_allowed(workspace):
             return workspace
         raise CodexRunError(f"Working directory is outside the worker's allowed roots: {workspace}")
+
+    def _workspace_path(self, requested: str | None) -> Path:
+        base_workspace = Path(self.config.workspace).expanduser().resolve()
+        if not requested:
+            return base_workspace
+        requested_path = Path(requested).expanduser()
+        if requested_path.is_absolute():
+            return requested_path.resolve()
+        return (base_workspace / requested_path).resolve()
 
     def _workspace_allowed(self, workspace: Path) -> bool:
         resource_permissions = self.config.resource_permissions or {}
@@ -341,7 +364,10 @@ class CodexRunner:
         )
 
     def _uses_codex_exec(self, command: list[str]) -> bool:
-        return command[:2] == ["codex", "exec"] and "--json" in command
+        return self._is_codex_exec_command(command) and "--json" in command
+
+    def _is_codex_exec_command(self, command: list[str]) -> bool:
+        return command[:2] == ["codex", "exec"]
 
     def _artifact_prompt(self, prompt: str) -> str:
         return (
@@ -360,12 +386,26 @@ class CodexRunner:
             metadata["thread_id"] = event["thread_id"]
         if "usage" in event:
             metadata["usage"] = event["usage"]
+        if str(event.get("type", "")) == "error":
+            metadata["detail"] = self._error_detail(event)
         item = event.get("item")
         if isinstance(item, dict):
             metadata["item_type"] = item.get("type", "unknown")
             if "id" in item:
                 metadata["item_id"] = item["id"]
         return metadata
+
+    def _error_detail(self, event: dict[str, object]) -> str:
+        for key in ("message", "detail", "error"):
+            value = event.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                nested = value.get("message") or value.get("detail") or value.get("error")
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+                return json.dumps(value, sort_keys=True)[:2000]
+        return json.dumps(event, sort_keys=True)[:2000]
 
     def _streamable_text(self, event: dict[str, object]) -> tuple[str, str]:
         event_type = str(event.get("type", ""))

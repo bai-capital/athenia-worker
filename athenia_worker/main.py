@@ -16,6 +16,7 @@ import httpx
 import qrcode
 
 from .client import AtheniaClient
+from .codex_sessions import discover_codex_sessions
 from .codex_runner import CodexRunError, CodexRunner, runtime_config_fingerprint
 from .config import DEFAULT_CONFIG_PATH, WorkerConfig
 
@@ -50,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     payload_parser = subparsers.add_parser("pairing-payload")
     payload_parser.set_defaults(func=cmd_pairing_payload)
+
+    sync_parser = subparsers.add_parser("sync-codex-sessions")
+    add_config_options(sync_parser)
+    sync_parser.add_argument("--limit", type=int, default=100)
+    sync_parser.set_defaults(func=cmd_sync_codex_sessions)
 
     serve_parser = subparsers.add_parser("serve")
     add_config_options(serve_parser)
@@ -148,10 +154,20 @@ def cmd_pairing_payload(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_codex_sessions(args: argparse.Namespace) -> int:
+    config = load_or_create_from_args(args)
+    with AtheniaClient(config) as client:
+        try_bootstrap(client)
+        count = sync_codex_sessions(client, limit=max(1, int(args.limit)))
+        print(f"Synced {count} Codex sessions.")
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     config = load_or_create_from_args(args)
     with AtheniaClient(config) as client:
         try_bootstrap(client)
+        sync_codex_sessions(client)
         emit_worker_log(
             client,
             "info",
@@ -383,6 +399,20 @@ def try_bootstrap(client: AtheniaClient) -> None:
 
     if bootstrap.get("status") == "pending":
         print_pairing_payload(client)
+
+
+def sync_codex_sessions(client: AtheniaClient, *, limit: int = 100) -> int:
+    sessions = discover_codex_sessions(limit=limit)
+    if not sessions:
+        emit_local_log("info", "No local Codex sessions found to sync.")
+        return 0
+    synced = client.sync_codex_sessions(sessions)
+    emit_local_log(
+        "info",
+        "Synced local Codex session catalog.",
+        {"discovered": len(sessions), "synced": len(synced or [])},
+    )
+    return len(synced or [])
 
 
 def handle_next_task(

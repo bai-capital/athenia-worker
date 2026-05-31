@@ -13,6 +13,12 @@ from .config import WorkerConfig
 
 @dataclass(frozen=True)
 class PairingPayload:
+    """Single-worker binding payload.
+
+    Athenia should bind workers from this exact payload instead of presenting a
+    global list of pending workers to users.
+    """
+
     worker_id: str
     pairing_secret: str
     server_url: str
@@ -87,6 +93,14 @@ class AtheniaClient:
             "/v1/worker-runtime/heartbeat",
             auth=True,
             json={"available_models": self.config.available_models},
+        )
+
+    def sync_codex_sessions(self, sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self._request(
+            "POST",
+            "/v1/worker-runtime/codex-sessions",
+            auth=True,
+            json={"sessions": sessions},
         )
 
     def log(self, level: str, message: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:

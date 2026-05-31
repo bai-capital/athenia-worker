@@ -44,8 +44,9 @@ Available permission levels are:
   for workers and workspaces you trust.
 
 `init` creates `~/.athenia-worker/config.json`, bootstraps the worker with the
-server, and prints an `athenia-worker://pair?...` QR payload. In Athenia, open
-Worker management and bind using that payload.
+server, and prints an `athenia-worker://pair?...` QR payload. In Athenia, bind by
+scanning or pasting that exact payload. The product should not show users a
+global list of all pending workers.
 
 If the worker was revoked or the saved runtime token is no longer accepted,
 `init` generates a fresh local worker identity and prints a new pairing payload.
@@ -54,6 +55,8 @@ You can force that behavior with `athenia-worker init --reset`.
 ## Security Model
 
 - The pairing secret is high entropy, one-time, and server-side hashed.
+- Worker binding is initiated from the exact `athenia-worker://pair?...` payload;
+  users should not browse or select from a global pending-worker list.
 - The runtime token is separate from the QR secret and is never shown in the QR
   payload.
 - The backend authenticates runtime calls with `Authorization: Bearer <token>`.
