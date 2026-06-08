@@ -8,12 +8,17 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Any
 
 from .config import WorkerConfig, bounded_codex_permission_level, with_codex_permission_level
 
 
 class CodexRunError(RuntimeError):
+    pass
+
+
+class CodexRunCancelled(CodexRunError):
     pass
 
 
@@ -39,6 +44,7 @@ class CodexRunner:
         runtime_config: dict[str, Any] | None = None,
         on_output: Callable[[str, str], None] | None = None,
         on_event: Callable[[str, dict[str, object]], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> CodexResult:
         runtime_config = runtime_config or {}
         workspace = self.workspace_from_runtime(runtime_config)
@@ -63,6 +69,7 @@ class CodexRunner:
                     output_path=output_path,
                     on_output=on_output,
                     on_event=on_event,
+                    should_cancel=should_cancel,
                 )
 
             expects_last_message = self._expects_last_message(command)
@@ -101,6 +108,7 @@ class CodexRunner:
         output_path: Path,
         on_output: Callable[[str, str], None] | None,
         on_event: Callable[[str, dict[str, object]], None] | None,
+        should_cancel: Callable[[], bool] | None,
     ) -> CodexResult:
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
@@ -108,6 +116,7 @@ class CodexRunner:
         final_message = ""
         codex_session_id: str | None = None
         codex_error = ""
+        cancelled = threading.Event()
 
         process = subprocess.Popen(
             command,
@@ -131,6 +140,27 @@ class CodexRunner:
 
         stderr_thread = threading.Thread(target=read_stderr, daemon=True)
         stderr_thread.start()
+
+        def watch_cancel() -> None:
+            if should_cancel is None:
+                return
+            while process.poll() is None:
+                try:
+                    if should_cancel():
+                        cancelled.set()
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        return
+                except Exception as exc:
+                    if on_event:
+                        on_event("cancel.check_failed", {"error": str(exc) or exc.__class__.__name__})
+                time.sleep(2)
+
+        cancel_thread = threading.Thread(target=watch_cancel, daemon=True)
+        cancel_thread.start()
 
         assert process.stdout is not None
         try:
@@ -171,6 +201,10 @@ class CodexRunner:
             process.kill()
             raise exc
         stderr_thread.join(timeout=5)
+        cancel_thread.join(timeout=1)
+
+        if cancelled.is_set():
+            raise CodexRunCancelled("Worker task stopped by user.")
 
         stdout = "".join(stdout_lines).strip()
         stderr = "".join(stderr_lines).strip()

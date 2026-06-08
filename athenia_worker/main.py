@@ -17,7 +17,7 @@ import qrcode
 
 from .client import AtheniaClient
 from .codex_sessions import discover_codex_sessions
-from .codex_runner import CodexRunError, CodexRunner, runtime_config_fingerprint
+from .codex_runner import CodexRunCancelled, CodexRunError, CodexRunner, runtime_config_fingerprint
 from .config import DEFAULT_CONFIG_PATH, WorkerConfig
 
 
@@ -491,6 +491,10 @@ def handle_task(
         def log_codex_event(event_type: str, metadata: dict[str, object]) -> None:
             emit_local_log("info", f"Codex event: {event_type}", metadata)
 
+        def should_cancel() -> bool:
+            task_status = client.get_task(task_id).get("status")
+            return task_status == "canceled"
+
         workspace = runner.workspace_from_runtime(runtime_config)
         before_artifacts = snapshot_workspace(workspace, config)
         result = runner.run(
@@ -499,6 +503,7 @@ def handle_task(
             runtime_config=runtime_config,
             on_output=send_output_frame,
             on_event=log_codex_event,
+            should_cancel=should_cancel,
         )
         streamed_frames = result.streamed_frames
         if result.streamed_frames == 0:
@@ -541,6 +546,9 @@ def handle_task(
                 "result_chars": len(result.content),
             },
         )
+    except CodexRunCancelled as exc:
+        task_completed = True
+        safe_emit_worker_log(client, "info", "Worker task stopped.", {"task_id": task_id, "reason": str(exc)})
     except (CodexRunError, subprocess.TimeoutExpired) as exc:
         message = str(exc)
         if not task_completed:

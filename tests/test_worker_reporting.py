@@ -10,7 +10,7 @@ import httpx
 from athenia_worker.client import AtheniaClient
 from athenia_worker.config import WorkerConfig, default_available_models
 from athenia_worker.codex_sessions import discover_codex_sessions
-from athenia_worker.codex_runner import CodexResult, CodexRunError, CodexRunner
+from athenia_worker.codex_runner import CodexResult, CodexRunCancelled, CodexRunError, CodexRunner
 from athenia_worker.main import handle_next_task
 
 
@@ -297,6 +297,17 @@ def test_handle_next_task_keeps_failure_path_best_effort_when_failure_report_fai
     assert ("log", "error", "Worker task failed.") in client.calls
 
 
+def test_handle_next_task_stops_without_failure_completion(tmp_path):
+    config = WorkerConfig(workspace=str(tmp_path))
+    client = ReportingClient(task={"id": "task-1", "input_text": "hello"})
+    runner = CancelledRunner(tmp_path)
+
+    assert handle_next_task(client, runner, config, tmp_path / "worker.json", threading.Lock()) is True
+
+    assert not [call for call in client.calls if call[0] == "complete_task"]
+    assert ("log", "info", "Worker task stopped.") in client.calls
+
+
 class ReportingClient:
     def __init__(
         self,
@@ -313,6 +324,10 @@ class ReportingClient:
     def next_task(self) -> dict[str, object] | None:
         self.calls.append(("next_task",))
         return self.task
+
+    def get_task(self, task_id: str) -> dict[str, object]:
+        self.calls.append(("get_task", task_id))
+        return {"id": task_id, "status": "running"}
 
     def send_frame(self, task_id: str, payload: bytes, content_type: str, *, mode: str):  # type: ignore[no-untyped-def]
         self.calls.append(("send_frame", task_id, payload.decode("utf-8"), content_type, mode))
@@ -356,3 +371,8 @@ class SuccessfulRunner:
 class FailingRunner(SuccessfulRunner):
     def run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         raise CodexRunError("codex exploded")
+
+
+class CancelledRunner(SuccessfulRunner):
+    def run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        raise CodexRunCancelled("Worker task stopped by user.")

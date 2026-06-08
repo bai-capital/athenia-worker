@@ -114,6 +114,9 @@ class AtheniaClient:
     def next_task(self) -> dict[str, Any] | None:
         return self._request("GET", "/v1/worker-runtime/tasks/next", auth=True)
 
+    def get_task(self, task_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/worker-runtime/tasks/{task_id}", auth=True)
+
     def send_frame(
         self,
         task_id: str,
